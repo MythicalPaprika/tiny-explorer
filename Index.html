@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Tiny Explorer — WebGL</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <style>
+    html,body { height:100%; margin:0; background:#111; overflow:hidden; font-family:Arial,Helvetica,sans-serif; }
+    #game { width:100%; height:100%; display:block; }
+    #ui {
+      position: absolute; right: 10px; top: 10px; color: #eee; text-shadow: 0 1px 0 #000;
+      background: rgba(0,0,0,0.25); padding:8px 10px; border-radius:8px; font-size:13px;
+    }
+    /* Touch controls */
+    .touchpad { position: absolute; bottom: 24px; left: 16px; width: 140px; height: 140px; border-radius: 50%; background: rgba(255,255,255,0.06); touch-action:none; }
+    .buttons { position:absolute; right: 16px; bottom: 24px; display:flex; flex-direction:column; gap:12px; }
+    .btn {
+      width:64px; height:64px; border-radius:12px; background:rgba(255,255,255,0.08); display:flex; align-items:center; justify-content:center;
+      color:#fff; font-weight:700; font-size:18px; user-select:none; touch-action:none;
+    }
+    .btn:active { background:rgba(255,255,255,0.18); transform: translateY(1px); }
+    #hint { position: absolute; left: 8px; top: 8px; color:#ddd; background:rgba(0,0,0,0.25); padding:6px 10px; border-radius:8px; font-size:12px;}
+    #fps { position:absolute; left:8px; bottom:8px; color:#ddd; font-size:12px; background:rgba(0,0,0,0.25); padding:6px 10px; border-radius:8px;}
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <div id="hint">Click / tap the screen to interact</div>
+  <div id="ui">WASD + Mouse (desktop) • Touch controls appear on mobile</div>
+  <div id="fps"></div>
+
+  <!-- Touch UI (only used on small screens) -->
+  <div id="touch-controls" style="display:none;">
+    <div class="touchpad" id="touchpad"></div>
+    <div class="buttons">
+      <div class="btn" id="btn-forward">▲</div>
+      <div style="display:flex;gap:8px">
+        <div class="btn" id="btn-left">◀</div>
+        <div class="btn" id="btn-jump">⤒</div>
+        <div class="btn" id="btn-right">▶</div>
+      </div>
+      <div class="btn" id="btn-back">▼</div>
+      <div class="btn" id="btn-sprint" style="background:rgba(255,255,255,0.05); font-size:14px;">Sprint</div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/three@0.158.0/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.158.0/examples/js/controls/PointerLockControls.js"></script>
+  <script>
+  (function(){
+    // Detect mobile
+    const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) || window.innerWidth < 700;
+
+    // Basic THREE setup
+    const canvas = document.getElementById('game');
+    const renderer = new THREE.WebGLRenderer({canvas, antialias:true});
+    renderer.setPixelRatio(window.devicePixelRatio || 1);
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x87ceeb); // sky blue
+
+    // Camera and controls
+    const camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 2000);
+    camera.position.set(0, 2, 5);
+
+    // Light
+    const sun = new THREE.DirectionalLight(0xffffff, 1.0);
+    sun.position.set(30, 60, -20);
+    scene.add(sun);
+    scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+
+    // Ground/terrain parameters
+    const GRID = 120; // vertices across
+    const SIZE = 300; // world size
+    const HALF = SIZE / 2;
+
+    // Create plane geometry and push vertices up to make hills (no external noise lib).
+    const geometry = new THREE.PlaneGeometry(SIZE, SIZE, GRID, GRID);
+    geometry.rotateX(-Math.PI / 2);
+
+    // deterministic pseudo-random seeded function (fast)
+    function seededNoise(x, z) {
+      // combine trig waves + small deterministic pseudo-random bumps
+      const a = Math.sin(x*0.08) * 6.5
+              + Math.cos(z*0.07) * 5.5
+              + Math.sin((x+z)*0.05)*3.5;
+      // hashed bump
+      const hx = Math.floor(x*7.3), hz = Math.floor(z*9.1);
+      const seed = (hx*1836311903 ^ hz*2971215073) >>> 0;
+      const small = ((seed % 1000) / 1000 - 0.5) * 2.0; // [-1,1]
+      return a + small * 2.2;
+    }
+
+    // raise vertices
+    for (let i=0; i<geometry.attributes.position.count; i++) {
+      const vx = geometry.attributes.position.getX(i);
+      const vz = geometry.attributes.position.getZ(i);
+      const height = seededNoise(vx, vz);
+      geometry.attributes.position.setY(i, height);
+    }
+    geometry.computeVertexNormals();
+
+    const material = new THREE.MeshStandardMaterial({color:0x6aa84f, flatShading:false});
+    const ground = new THREE.Mesh(geometry, material);
+    ground.receiveShadow = true;
+    scene.add(ground);
+
+    // Simple water plane (low)
+    const water = new THREE.Mesh(new THREE.PlaneGeometry(SIZE*1.2, SIZE*1.2), new THREE.MeshBasicMaterial({color:0x60a7ff, opacity:0.12, transparent:true}));
+    water.rotateX(-Math.PI/2);
+    water.position.y = -1.8;
+    scene.add(water);
+
+    // Scatter objects: trees and rocks
+    const rnd = sfc32(1337, 2345, 3456, 4567); // deterministic RNG
+    const treeGroup = new THREE.Group();
+    const rockGroup = new THREE.Group();
+    scene.add(treeGroup);
+    scene.add(rockGroup);
+
+    for (let i=0; i<120; i++) {
+      const x = (rnd()-0.5) * SIZE * 0.9;
+      const z = (rnd()-0.5) * SIZE * 0.9;
+      const y = getHeightAt(x, z) || 0;
+
+      if (rnd() > 0.7) {
+        // tree: trunk + foliage
+        const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.25,0.25,1.4,8), new THREE.MeshStandardMaterial({color:0x7b4f2e}));
+        trunk.position.set(x, y + 0.7, z);
+        const leaves = new THREE.Mesh(new THREE.SphereGeometry(1.0, 8, 8), new THREE.MeshStandardMaterial({color:0x2f7d2a}));
+        leaves.position.set(x, y + 1.8, z);
+        treeGroup.add(trunk);
+        treeGroup.add(leaves);
+      } else {
+        // rock
+        const s = 0.6 + rnd()*1.0;
+        const rock = new THREE.Mesh(new THREE.DodecahedronGeometry(s,0), new THREE.MeshStandardMaterial({color:0x8a8a8a}));
+        rock.position.set(x, y + s*0.2, z);
+        rock.rotation.set(rnd()*Math.PI, rnd()*Math.PI, rnd()*Math.PI);
+        rockGroup.add(rock);
+      }
+    }
+
+    // Player physics state
+    const player = {
+      height: 1.8,
+      speed: 6.0,
+      sprintMultiplier:1.8,
+      velocity: new THREE.Vector3(0,0,0),
+      canJump: false
+    };
+
+    // Controls
+    const keys = { forward:false, back:false, left:false, right:false, jump:false, sprint:false };
+
+    // Desktop pointerlock controls
+    const controls = new THREE.PointerLockControls(camera, renderer.domElement);
+    // On click, request pointer lock (desktop)
+    renderer.domElement.addEventListener('click', ()=> {
+      if (!isMobile) controls.lock();
+    });
+
+    // handle key input
+    window.addEventListener('keydown', (e)=> {
+      if (e.repeat) return;
+      if (e.key === 'w' || e.key === 'W') keys.forward = true;
+      if (e.key === 's' || e.key === 'S') keys.back = true;
+      if (e.key === 'a' || e.key === 'A') keys.left = true;
+      if (e.key === 'd' || e.key === 'D') keys.right = true;
+      if (e.code === 'Space') keys.jump = true;
+      if (e.shiftKey) keys.sprint = true;
+    });
+    window.addEventListener('keyup', (e)=> {
+      if (e.key === 'w' || e.key === 'W') keys.forward = false;
+      if (e.key === 's' || e.key === 'S') keys.back = false;
+      if (e.key === 'a' || e.key === 'A') keys.left = false;
+      if (e.key === 'd' || e.key === 'D') keys.right = false;
+      if (e.code === 'Space') keys.jump = false;
+      if (!e.shiftKey) keys.sprint = false;
+    });
+
+    // Mobile touch controls
+    const touchControls = document.getElementById('touch-controls');
+    if (isMobile) {
+      touchControls.style.display = 'block';
+      document.getElementById('hint').style.display = 'none';
+    }
+
+    // touchpad: drag to look
+    let pointerDown = false;
+    let lastTouchX = 0, lastTouchY = 0;
+    let yaw = 0, pitch = 0;
+    const touchpad = document.getElementById('touchpad');
+
+    function handleTouchStart(e){
+      pointerDown = true;
+      const t = e.touches ? e.touches[0] : e;
+      lastTouchX = t.clientX;
+      lastTouchY = t.clientY;
+    }
+    function handleTouchMove(e){
+      if (!pointerDown) return;
+      const t = e.touches ? e.touches[0] : e;
+      const dx = t.clientX - lastTouchX;
+      const dy = t.clientY - lastTouchY;
+      lastTouchX = t.clientX;
+      lastTouchY = t.clientY;
+      // sensitivity scale
+      const s = 0.0025;
+      yaw -= dx * s;
+      pitch -= dy * s;
+      pitch = Math.max(-Math.PI/2 + 0.1, Math.min(Math.PI/2 - 0.1, pitch));
+      camera.quaternion.setFromEuler(new THREE.Euler(pitch, yaw, 0, 'YXZ'));
+    }
+    function handleTouchEnd(e){
+      pointerDown = false;
+    }
+    touchpad.addEventListener('touchstart', handleTouchStart);
+    touchpad.addEventListener('touchmove', handleTouchMove);
+    touchpad.addEventListener('touchend', handleTouchEnd);
+    touchpad.addEventListener('mousedown', (e) => { handleTouchStart(e); window.addEventListener('mousemove', handleTouchMove); });
+    window.addEventListener('mouseup', (e) => { handleTouchEnd(e); window.removeEventListener('mousemove', handleTouchMove); });
+
+    // on-screen movement buttons
+    const btnMap = {
+      'btn-forward': ()=> keys.forward = true,
+      'btn-back': ()=> keys.back = true,
+      'btn-left': ()=> keys.left = true,
+      'btn-right': ()=> keys.right = true,
+      'btn-jump': ()=> { keys.jump = true; setTimeout(()=> keys.jump=false, 120); },
+      'btn-sprint': ()=> { keys.sprint = !keys.sprint; const b = document.getElementById('btn-sprint'); b.style.background = keys.sprint ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.05)'; }
+    };
+    for (const id in btnMap) {
+      const el = document.getElementById(id);
+      if (!el) continue;
+      el.addEventListener('touchstart', (e)=>{ e.preventDefault(); if (id !== 'btn-sprint') keysFromId(id,true); if (id === 'btn-sprint') btnMap[id](); });
+      el.addEventListener('touchend', (e)=>{ e.preventDefault(); if (id !== 'btn-sprint') keysFromId(id,false); });
+      el.addEventListener('mousedown', (e)=>{ e.preventDefault(); if (id !== 'btn-sprint') keysFromId(id,true); if (id === 'btn-sprint') btnMap[id](); });
+      el.addEventListener('mouseup', (e)=>{ e.preventDefault(); if (id !== 'btn-sprint') keysFromId(id,false); });
+    }
+    function keysFromId(id, down) {
+      if (id === 'btn-forward') keys.forward = down;
+      if (id === 'btn-back') keys.back = down;
+      if (id === 'btn-left') keys.left = down;
+      if (id === 'btn-right') keys.right = down;
+      if (id === 'btn-jump' && down) { keys.jump = true; setTimeout(()=> keys.jump=false, 120); }
+    }
+
+    // Helpers: seeded RNG
+    function sfc32(a,b,c,d) {
+      return function(){
+        a |= 0; b |= 0; c |= 0; d |= 0;
+        var t = (a + b | 0) + d | 0;
+        d = d + 1 | 0;
+        a = b ^ b >>> 9;
+        b = c + (c << 3) | 0;
+        c = (c << 21 | c >>> 11);
+        c = c + t | 0;
+        return (t >>> 0) / 4294967296;
+      }
+    }
+
+    // get height at world x,z by sampling plane geometry (fast approximate)
+    function getHeightAt(x, z) {
+      // Map world position to plane local coordinates (plane is centered at 0,0)
+      // Instead of interpolating from geometry, we reuse seededNoise to match terrain.
+      return seededNoise(x, z);
+    }
+
+    // simple collision detection with ground: place camera y = height + player.height
+    function updatePlayerPosition(delta) {
+      // movement vector relative to camera orientation (horizontal plane)
+      const forward = new THREE.Vector3();
+      camera.getWorldDirection(forward);
+      forward.y = 0; forward.normalize();
+      const right = new THREE.Vector3();
+      right.crossVectors(new THREE.Vector3(0,1,0), forward).normalize();
+
+      let move = new THREE.Vector3();
+      if (keys.forward) move.add(forward);
+      if (keys.back) move.sub(forward);
+      if (keys.left) move.sub(right);
+      if (keys.right) move.add(right);
+
+      if (move.lengthSq() > 0) move.normalize();
+
+      const spd = player.speed * (keys.sprint ? player.sprintMultiplier : 1.0);
+      player.velocity.x = move.x * spd;
+      player.velocity.z = move.z * spd;
+
+      // gravity
+      const GRAVITY = -20.0;
+      player.velocity.y += GRAVITY * delta;
+
+      // predictive position
+      const pos = new THREE.Vector3(camera.position.x, camera.position.y, camera.position.z);
+      pos.addScaledVector(player.velocity, delta);
+
+      // check ground height at the new x,z
+      const groundH = getHeightAt(pos.x, pos.z) + player.height;
+      if (pos.y <= groundH) {
+        // landed
+        player.velocity.y = 0;
+        pos.y = groundH;
+        player.canJump = true;
+      } else {
+        player.canJump = false;
+      }
+
+      // jump
+      if (keys.jump && player.canJump) {
+        player.velocity.y = 7.2;
+        player.canJump = false;
+      }
+
+      camera.position.set(pos.x, pos.y, pos.z);
+    }
+
+    // Init camera starting position (on ground)
+    camera.position.y = getHeightAt(0,0) + player.height;
+    camera.position.x = 0; camera.position.z = 5;
+
+    // basic HUD fps
+    let lastTime = performance.now();
+    let frames = 0;
+    const fpsEl = document.getElementById('fps');
+
+    // Animation loop
+    function animate() {
+      requestAnimationFrame(animate);
+      const now = performance.now();
+      const delta = Math.min(0.05, (now - lastTime) / 1000); // clamp delta
+      lastTime = now;
+
+      // If desktop & pointer locked, update camera rotation is automatic via controls
+      if (!isMobile && controls.isLocked === false) {
+        // show a hint
+        document.getElementById('hint').style.display = 'block';
+      } else {
+        document.getElementById('hint').style.display = 'none';
+      }
+
+      updatePlayerPosition(delta);
+
+      renderer.render(scene, camera);
+
+      // fps counter
+      frames++;
+      if (now % 1000 < 16) {
+        fpsEl.innerText = `${Math.round(1/delta)} FPS`;
+      }
+    }
+    animate();
+
+    // resize handling
+    window.addEventListener('resize', ()=> {
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+    });
+
+    // Utility: seededNoise wrapper available in this scope too
+    function seededNoise(x, z) {
+      // matched earlier function in plane generation
+      const a = Math.sin(x*0.08) * 6.5
+              + Math.cos(z*0.07) * 5.5
+              + Math.sin((x+z)*0.05)*3.5;
+      const hx = Math.floor(x*7.3), hz = Math.floor(z*9.1);
+      const seed = (hx*1836311903 ^ hz*2971215073) >>> 0;
+      const small = ((seed % 1000) / 1000 - 0.5) * 2.0;
+      return a + small * 2.2;
+    }
+
+    // Allow clicking on mobile to focus (and for pointer lock when supported)
+    // Attempt to lock pointer if supported on small-screen devices after user gesture
+    if (isMobile) {
+      renderer.domElement.addEventListener('touchstart', ()=> {
+        // Some browsers require user gesture to enable some features; this is just a no-op.
+      }, {passive:true});
+    }
+
+    // Done
+  })();
+  </script>
+</body>
+</html>
